@@ -16,7 +16,7 @@ import qualified Language.C.Inline as C
 import qualified Web.Scotty as S
 import Data.Monoid ((<>))
 import Data.Either
-import Data.Text as T
+import Data.Text.Lazy as T
 
 C.context (C.baseCtx <> C.bsCtx)
 
