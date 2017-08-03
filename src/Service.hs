@@ -15,13 +15,14 @@ import qualified Language.C.Inline as C
 
 import qualified Web.Scotty as S
 import Data.Monoid ((<>))
+import Data.Either
 
 C.context (C.baseCtx <> C.bsCtx)
 
 C.include "windows.h"
 C.include "winsvc.h"
 
-isServiceRunning:: C8.ByteString-> S.ActionM Bool
+isServiceRunning:: C8.ByteString-> S.ActionM (Either Text Bool)
 isServiceRunning name = do
   ibool <- liftIO $ fmap fromIntegral
     [C.block|int
@@ -32,21 +33,29 @@ isServiceRunning name = do
         sz_svc_name = $bs-len:name;
         s_svc_name = malloc( sz_svc_name + 1);
         if( !s_svc_name)
-          return 0;
+          return 1;
         s_svc_name[ sz_svc_name ] = 0;
         memcpy( s_svc_name, $bs-ptr:name, sz_svc_name);
         SC_HANDLE h_scm = 0;
         h_scm = OpenSCManager( 0, 0, GENERIC_READ);
         if( !h_scm)
         {
+          ret = 2;
           goto cleanup1;
         }
         SC_HANDLE h_svc = 0;
         h_svc = OpenService( h_scm, s_svc_name, SERVICE_QUERY_STATUS);
         if( !h_svc)
         {
-          printf( "failed to open service %s\n", s_svc_name);
+          ret = 3;
           goto cleanup2;
+        }
+        SERVICE_STATUS ss;
+        memset( &ss, sizeof( ss), 0);
+        if( !QueryServiceStatus( h_svc, &ss))
+        {
+           ret = 4;
+           goto cleanup3;
         }
 
 
@@ -59,6 +68,10 @@ isServiceRunning name = do
         return ret;
       }
               |]
-  if ibool == 0
-    then return False
-    else return True
+  return $ case ibool of
+    0 -> Right True
+    1 -> Left "failed to allocate temp memory"
+    2 -> Left "failed to open SC manager"
+    3 -> Left "failed to open service"
+    4 -> Left "failed to query service"
+
