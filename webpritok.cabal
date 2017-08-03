@@ -21,8 +21,9 @@ library
                      , bytestring
                      , inline-c
                      , text
+                     , aeson
   default-language:    Haskell2010
-  default-extensions:          Strict
+  default-extensions:  Strict
   c-sources:           src/Service.c
   ghc-options:         -fno-full-laziness
 
@@ -30,7 +31,7 @@ executable webpritok-exe
   hs-source-dirs:      app
   main-is:             Main.hs
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N -with-rtsopts=-c -with-rtsopts=-T -fno-full-laziness
-  default-extensions:          Strict
+  default-extensions:  Strict
   build-depends:       base
                      , webpritok
                      , scotty

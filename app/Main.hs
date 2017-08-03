@@ -28,7 +28,9 @@ main = WS.scotty 3000 $ do
   
   -- first, authenticate get request
   WS.get (WS.function matchBadGetAuthenticate) doBadGetAuthenticate
-  WS.get "/service/running/:name" $ doServiceStatus
+  WS.get "/service/state/:name" $ doServiceStatus
+  WS.get "/service/stop/:name" doServiceStop
+  WS.get "/service/start/:name" doServiceStart
   WS.get (WS.function $ \_-> Just []) $ handleGet
 
   -- post request
@@ -98,12 +100,33 @@ doBadGetAuthenticate = WS.status $ HTTP.serviceUnavailable503
 -- | checks 
 doServiceStatus:: WS.ActionM ()
 doServiceStatus = do
-  liftIO $ print "service status"
   name <- WS.param "name"
-  erunning <- isServiceRunning name
-  case erunning of
-    Right False -> WS.status $ HTTP.serviceUnavailable503
-    Right True -> WS.status $ HTTP.ok200
+  estate <- liftIO $ getServiceState name
+  case estate of
+    Right status -> WS.json status
     Left err -> do
-      WS.text err
       WS.status $ HTTP.serviceUnavailable503
+      WS.text err
+      
+
+-- | checks 
+doServiceStart:: WS.ActionM ()
+doServiceStart = do
+  name <- WS.param "name"
+  merr <- liftIO $ startService name
+  case merr of
+    Nothing -> WS.status $ HTTP.ok200
+    Just err -> do
+      WS.status $ HTTP.serviceUnavailable503
+      WS.text err
+
+-- | checks 
+doServiceStop:: WS.ActionM ()
+doServiceStop = do
+  name <- WS.param "name"
+  merr <- liftIO $ stopService name
+  case merr of
+    Nothing -> WS.status $ HTTP.ok200
+    Just err -> do
+      WS.status $ HTTP.serviceUnavailable503
+      WS.text err
