@@ -101,7 +101,7 @@ doServiceStatus = do
   liftIO $ print "service status"
   name <- WS.param "name"
   erunning <- isServiceRunning name
-  case running of
+  case erunning of
     Right False -> WS.status $ HTTP.serviceUnavailable503
     Right True -> WS.status $ HTTP.ok200
     Left err -> do
