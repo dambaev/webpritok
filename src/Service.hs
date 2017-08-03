@@ -42,10 +42,10 @@ isServiceRunning name = do
           goto cleanup1;
         }
         SC_HANDLE h_svc = 0;
-        printf( "svc = %s\n", s_svc_name);
-        h_svc = OpenService( h_scm, s_svc_name, GENERIC_READ);
+        h_svc = OpenService( h_scm, s_svc_name, SERVICE_QUERY_STATUS);
         if( !h_svc)
         {
+          printf( "failed to open service %s\n", s_svc_name);
           goto cleanup2;
         }
 
