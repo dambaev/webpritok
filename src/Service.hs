@@ -14,6 +14,7 @@ import qualified Data.ByteString.Char8 as C8
 import qualified Language.C.Inline as C
 
 import qualified Web.Scotty as S
+import Data.Monoid ((<>))
 
 C.context (C.baseCtx <> C.bsCtx)
 
