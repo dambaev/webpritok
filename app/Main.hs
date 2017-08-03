@@ -98,6 +98,7 @@ doBadGetAuthenticate = WS.status $ HTTP.serviceUnavailable503
 -- | checks 
 doServiceStatus:: WS.ActionM ()
 doServiceStatus = do
+  liftIO $ print "service status"
   name <- WS.param "name"
   running <- isServiceRunning name
   if not running
