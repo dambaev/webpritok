@@ -37,7 +37,7 @@ isServiceRunning name = do
         memcpy( s_svc_name, $bs-ptr:name, sz_svc_name);
         SC_HANDLE h_scm = 0;
         h_scm = OpenSCManager( 0, 0, GENERIC_READ);
-        if( !h_svc)
+        if( !h_scm)
         {
           goto cleanup1;
         }
@@ -49,8 +49,10 @@ isServiceRunning name = do
         }
 
 
-        cleanup2:
+        cleanup3:
         CloseServiceHandle( h_svc);
+        cleanup2:
+        CloseServiceHandle( h_scm);
         cleanup1:
         free( s_svc_name);
         return ret;
