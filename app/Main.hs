@@ -104,4 +104,6 @@ doServiceStatus = do
   case running of
     Right False -> WS.status $ HTTP.serviceUnavailable503
     Right True -> WS.status $ HTTP.ok200
-    Left err -> text err
+    Left err -> do
+      WS.text err
+      WS.status $ HTTP.serviceUnavailable503
