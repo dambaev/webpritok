@@ -3,6 +3,10 @@
 module Main where
 
 import qualified Web.Scotty as WS
+import qualified Network.Wai.Handler.Warp as Warp
+import qualified Network.HTTP.Types.Method as HTTP
+  ( methodPost
+  )
 import qualified Network.HTTP.Types.Status as HTTP
   ( serviceUnavailable503
   , ok200
@@ -19,22 +23,50 @@ import qualified Network.Wai as Wai
 
 import qualified Data.ByteString.Char8 as C8
 
+import qualified Data.ByteString.Lazy as LBS
+
+import           Data.Conduit
+  ( ($$)
+  )
+import qualified Data.Conduit.List as C
+import qualified Data.Conduit.Binary as C
+import qualified Control.Monad.Trans.Resource as R
+import qualified Network.Wai.Conduit as C
+  ( sourceRequestBody
+  )
+
+import System.IO
+
 import Service
 
+opts :: WS.Options
+opts = WS.Options
+  { verbose = 0
+  , settings = Warp.setHost "0.0.0.0" Warp.defaultSettings
+  }
+
 main :: IO ()
-main = WS.scotty 3000 $ do
-  -- maybe, it should be authenticated too?
-  WS.get "/status" $ doStatus
-  
-  -- first, authenticate get request
-  WS.get (WS.function matchBadGetAuthenticate) doBadGetAuthenticate
-  WS.get "/service/state/:name" $ doServiceStatus
-  WS.get "/service/stop/:name" doServiceStop
-  WS.get "/service/start/:name" doServiceStart
-  WS.get (WS.function $ \_-> Just []) $ handleGet
+main = do
+
+  app <- WS.scottyApp myWebApp
+  WS.scottyOpts opts $ WS.middleware $ myMiddleware app
+
+myWebApp :: WS.ScottyM ()
+myWebApp = do
+    -- maybe, it should be authenticated too?
+    WS.get "/status" $ doStatus
+    
+    -- first, authenticate get request
+    WS.get (WS.function matchBadGetAuthenticate) doBadGetAuthenticate
+    WS.get "/service/state/:name" $ doServiceStatus
+    WS.get "/service/stop/:name" doServiceStop
+    WS.get "/service/start/:name" doServiceStart
+  --  WS.get "/app/pritok/status"
+    WS.get (WS.function $ \_-> Just []) $ handleGet
 
   -- post request
-
+--  WS.post (WS.function $ \_-> Nothing) undefined
+--    WS.post "/app/pritok/uploaddb" uploadDB
 
 
 -- GS.GCStats should be representable as JSON data  
@@ -130,3 +162,19 @@ doServiceStop = do
     Just err -> do
       WS.status $ HTTP.serviceUnavailable503
       WS.text err
+
+uploadDB :: Wai.Application 
+uploadDB request respond = do
+  -- check for free space, header and etc
+  R.runResourceT $ C.sourceRequestBody request $$ C.sinkFile "test2"
+  respond $ Wai.responseLBS HTTP.ok200 [] ""
+  
+
+myMiddleware :: Wai.Application -> Wai.Application-> Wai.Application
+myMiddleware app app1 request respond = do
+  case () of
+    _ | Wai.requestMethod request == HTTP.methodPost -> do
+        if Wai.pathInfo request == [ "app", "pritok", "uploaddb" ]
+          then uploadDB request respond
+          else app request respond
+    _ -> app request respond
