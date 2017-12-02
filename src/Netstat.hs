@@ -4,7 +4,7 @@
 {-# LANGUAGE QuasiQuotes #-}
 
 module Netstat
-	where
+    where
 
 import qualified Language.C.Inline as C
 import qualified Control.Monad.Trans.Either as E
@@ -22,10 +22,9 @@ import Control.Monad.IO.Class
   ( MonadIO
   , liftIO
   )
+import Types
 
 C.context (C.baseCtx <> C.bsCtx)
-
-type Error = Text
 
 C.include "winsock2.h"
 C.include "ws2tcpip.h"
@@ -33,12 +32,13 @@ C.include "iphlpapi.h"
 
 
 isTcpPortListening
-	:: Int
-	-> EitherT Error IO Bool
+    :: Int
+    -> EitherT Error IO Bool
 isTcpPortListening port' = do
     ret <- liftIO $ worker
-    case ret of
-        tcpStateListen -> E.right True
+    case () of
+        _ | ret < 0 -> E.left "error querying tcptable"
+        _ | ret == [C.pure|int{MIB_TCP_STATE_LISTEN}|] -> E.right True
         _ -> E.right False
     where
         port = fromIntegral port'
@@ -62,7 +62,6 @@ isTcpPortListening port' = do
 
                 pTcpTable = (MIB_TCPTABLE *) MALLOC(sizeof (MIB_TCPTABLE));
                 if (pTcpTable == NULL) {
-                    printf("Error allocating memory\n");
                     return -1;
                 }
 
@@ -74,14 +73,12 @@ isTcpPortListening port' = do
                     FREE(pTcpTable);
                     pTcpTable = (MIB_TCPTABLE *) MALLOC(dwSize);
                     if (pTcpTable == NULL) {
-                        printf("Error allocating memory\n");
                         return -1;
                     }
                 }
             // Make a second call to GetTcpTable to get
             // the actual data we require
                 if ((dwRetVal = GetTcpTable(pTcpTable, &dwSize, TRUE)) == NO_ERROR) {
-                    printf("\tNumber of entries: %d\n", (int) pTcpTable->dwNumEntries);
                     for (i = 0; i < (int) pTcpTable->dwNumEntries; i++) {
                         if( ntohs((u_short)pTcpTable->table[i].dwLocalPort) == $(int port))
                         {
@@ -90,7 +87,6 @@ isTcpPortListening port' = do
                         }
                     }
                 } else {
-                    printf("\tGetTcpTable failed with %d\n", dwRetVal);
                     FREE(pTcpTable);
                     return -1;
                 }

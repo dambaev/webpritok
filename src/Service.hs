@@ -50,6 +50,8 @@ import qualified Control.Monad.Trans.Either as E
   , runEitherT
   )
 
+import Types
+
 C.context (C.baseCtx <> C.bsCtx)
 
 C.include "windows.h"
@@ -79,8 +81,6 @@ instance A.ToJSON ServiceState where
         SS_Paused -> "paused"
         SS_PausePending -> "pause_pending"
         SS_ContinuePending -> "continue_pending"
-
-type Error = Text
 
 data ServiceHandle = ServiceHandle ( Ptr ())
 data ServiceAccess = ServiceAccess C.CULong
