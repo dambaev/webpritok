@@ -9,16 +9,45 @@ module Service
 
 import qualified Data.ByteString.Char8 as C8
 import qualified Language.C.Inline as C
+import qualified Control.Concurrent as C
+import qualified System.Timeout as T
+import qualified Control.Exception as E
+  ( bracket
+  )
+
+import Data.Word
+  ( Word32
+  )
+
+import Foreign.Ptr
+  ( Ptr
+  , nullPtr
+  )
 
 import Data.Monoid ((<>))
 import Data.Either
 import Data.Text.Lazy as T
+import Data.List as L
 
 import qualified Data.Aeson.Types as A
   ( toJSON
   , ToJSON
   , object
   , (.=)
+  )
+
+import Control.Monad.IO.Class
+  ( MonadIO
+  , liftIO
+  )
+import Control.Monad.Trans.Either
+  ( EitherT
+  , hoistEither
+  )
+import qualified Control.Monad.Trans.Either as E
+  ( left
+  , right
+  , runEitherT
   )
 
 C.context (C.baseCtx <> C.bsCtx)
@@ -34,6 +63,7 @@ data ServiceState
   | SS_Paused
   | SS_PausePending
   | SS_ContinuePending
+  deriving Eq
 
 instance A.ToJSON ServiceState where
   toJSON state = A.object
@@ -52,242 +82,273 @@ instance A.ToJSON ServiceState where
 
 type Error = Text
 
-getServiceState:: C8.ByteString-> IO (Either Error ServiceState)
-getServiceState name = do
-  ibool <- fmap fromIntegral
+data ServiceHandle = ServiceHandle ( Ptr ())
+data ServiceAccess = ServiceAccess C.CULong
+data SCMHandle = SCMHandle ( Ptr ())
+
+data SCMAccess = SCMAccess C.CULong
+
+scmAccessRead = SCMAccess [C.pure|unsigned long{ GENERIC_READ}|]
+
+scmAccessAll = SCMAccess [C.pure|unsigned long{SC_MANAGER_ALL_ACCESS}|]
+
+serviceAccessStart = ServiceAccess [C.pure|unsigned long{SERVICE_START | SERVICE_QUERY_STATUS}|]
+
+serviceAccessStop = ServiceAccess [C.pure|unsigned long{SERVICE_STOP | SERVICE_QUERY_STATUS}|]
+
+serviceAccessQuery = ServiceAccess [C.pure|unsigned long{SERVICE_QUERY_STATUS}|]
+
+serviceAccessAll = ServiceAccess [C.pure|unsigned long{SERVICE_ALL_ACCESS}|]
+
+getServiceState
+  :: ServiceHandle
+  -> EitherT Error IO ServiceState
+getServiceState (ServiceHandle svc) = do
+  ibool <- fmap fromIntegral $ liftIO
     [C.block|int
       {
-        char * s_svc_name = 0;
-        size_t sz_svc_name = 0;
-        int ret = 0;
-        sz_svc_name = $bs-len:name;
-        s_svc_name = malloc( sz_svc_name + 1);
-        if( !s_svc_name)
-          return -1;
-        s_svc_name[ sz_svc_name ] = 0;
-        memcpy( s_svc_name, $bs-ptr:name, sz_svc_name);
-        SC_HANDLE h_scm = 0;
-        h_scm = OpenSCManager( 0, 0, GENERIC_READ);
-        if( !h_scm)
-        {
-          ret = -2;
-          goto cleanup1;
-        }
-        SC_HANDLE h_svc = 0;
-        h_svc = OpenService( h_scm, s_svc_name, SERVICE_QUERY_STATUS);
-        if( !h_svc)
-        {
-          ret = -3;
-          goto cleanup2;
-        }
         SERVICE_STATUS ss;
         memset( &ss, sizeof( ss), 0);
-        if( !QueryServiceStatus( h_svc, &ss))
+        if( !QueryServiceStatus( $(void* svc), &ss))
         {
-           ret = -4;
-           goto cleanup3;
+           return -1;
         }
 
-        ret = ss. dwCurrentState;
-
-        cleanup3:
-        CloseServiceHandle( h_svc);
-        cleanup2:
-        CloseServiceHandle( h_scm);
-        cleanup1:
-        free( s_svc_name);
-        return ret;
+        return ss. dwCurrentState;
       }
-              |]
-  return $ case ibool of
-    (-1) -> Left "failed to allocate temp memory"
-    (-2) -> Left "failed to open SC manager"
-    (-3) -> Left "failed to open service"
-    (-4) -> Left "failed to query service"
-    1 -> Right SS_Stopped
-    2 -> Right SS_StartPending
-    3 -> Right SS_StopPending
-    4 -> Right SS_Running
-    5 -> Right SS_ContinuePending
-    6 -> Right SS_PausePending
-    7 -> Right SS_Paused
-    _ -> Left "unsupported service status returned"
+    |]
+  case ibool of
+    (-1) -> E.left "failed to query service"
+    1 -> E.right SS_Stopped
+    2 -> E.right SS_StartPending
+    3 -> E.right SS_StopPending
+    4 -> E.right SS_Running
+    5 -> E.right SS_ContinuePending
+    6 -> E.right SS_PausePending
+    7 -> E.right SS_Paused
+    _ -> E.left "unsupported service status returned"
 
-startService:: C8.ByteString-> IO (Maybe Error)
-startService name = do
-  iret <- fmap fromIntegral $
-    [C.block| int
-     {
-        char * s_svc_name = 0;
-        size_t sz_svc_name = 0;
-        int ret = 0;
-        sz_svc_name = $bs-len:name;
-        s_svc_name = malloc( sz_svc_name + 1);
-        if( !s_svc_name)
-          return -1;
-        s_svc_name[ sz_svc_name ] = 0;
-        memcpy( s_svc_name, $bs-ptr:name, sz_svc_name);
-        SC_HANDLE h_scm = 0;
-        h_scm = OpenSCManager( 0, 0, GENERIC_READ);
-        if( !h_scm)
-        {
-          ret = -2;
-          goto cleanup1;
-        }
-        SC_HANDLE h_svc = 0;
-        h_svc = OpenService( h_scm, s_svc_name, SERVICE_START);
-        if( !h_svc)
-        {
-          ret = -3;
-          goto cleanup2;
-        }
-
-        if( !StartService( h_svc, 0, 0))
-        {
-          ret = 0;
-        }else
-        {
-          ret = 1;
-        }
+startService
+  :: ServiceHandle
+  -> EitherT Error IO ()
+startService svc_@(ServiceHandle svc) = do
+  state <- getServiceState svc_
+  if state == SS_Running
+    then return ()
+    else do
+      iret <- fmap fromIntegral $ liftIO
+        [C.block| int
+         {
+           if( !StartService( $(void* svc), 0, 0))
+           {
+             return 0;
+           }
+           return 1;
+         }
+         |]
+      case iret of
+        0    -> E.left "failed to start"
+        1    -> E.right ()
+        _    -> E.left "unsupported return code"
 
 
-        cleanup3:
-        CloseServiceHandle( h_svc);
-        cleanup2:
-        CloseServiceHandle( h_scm);
-        cleanup1:
-        free( s_svc_name);
-        return ret;
-     }
-     |]
-  return $ case iret of
-    0    -> Just "failed to start"
-    1    -> Nothing
-    (-1) -> Just "failed to allocate temp memory"
-    (-2) -> Just "failed to open SC manager"
-    (-3) -> Just "failed to open service"
-    (-4) -> Just "failed to query service"
-    _    -> Just "unsupported return code"
+stopService
+  :: ServiceHandle
+  -> EitherT Error IO ()
+stopService svc_@(ServiceHandle svc) = do
+  state <- getServiceState svc_
+  if state == SS_Stopped
+    then return ()
+    else do
+      iret <- fmap fromIntegral $ liftIO
+        [C.block| int
+         {
+            SERVICE_STATUS ss;
+            if( !ControlService( $(void *svc), SERVICE_CONTROL_STOP, &ss))
+            {
+              return 0;
+            }
+            return 1;
+         }
+         |]
+      case iret of
+        0    -> E.left "failed to stop"
+        1    -> E.right ()
+        some -> E.left $ "unexpected return code " `T.append` (T.pack $ show some)
 
 
-stopService:: C8.ByteString-> IO (Maybe Error)
-stopService name = do
-  iret <- fmap fromIntegral $
-    [C.block| int
-     {
-        char * s_svc_name = 0;
-        size_t sz_svc_name = 0;
-        int ret = 0;
-        sz_svc_name = $bs-len:name;
-        s_svc_name = malloc( sz_svc_name + 1);
-        if( !s_svc_name)
-          return -1;
-        s_svc_name[ sz_svc_name ] = 0;
-        memcpy( s_svc_name, $bs-ptr:name, sz_svc_name);
-        SC_HANDLE h_scm = 0;
-        h_scm = OpenSCManager( 0, 0, GENERIC_READ);
-        if( !h_scm)
-        {
-          ret = -2;
-          goto cleanup1;
-        }
-        SC_HANDLE h_svc = 0;
-        h_svc = OpenService( h_scm, s_svc_name, SERVICE_STOP);
-        if( !h_svc)
-        {
-          ret = -3;
-          goto cleanup2;
-        }
 
-        SERVICE_STATUS ss;
-        if( !ControlService( h_svc, SERVICE_CONTROL_STOP, &ss))
-        {
-          ret = 0;
-        }else
-        {
-          ret = 1;
-        }
-
-
-        cleanup3:
-        CloseServiceHandle( h_svc);
-        cleanup2:
-        CloseServiceHandle( h_scm);
-        cleanup1:
-        free( s_svc_name);
-        return ret;
-     }
-     |]
-  return $ case iret of
-    0    -> Just "failed to stop"
-    1    -> Nothing
-    (-1) -> Just "failed to allocate temp memory"
-    (-2) -> Just "failed to open SC manager"
-    (-3) -> Just "failed to open service"
-    (-4) -> Just "failed to query service"
-    _    -> Just "unsupported return code"
+killServiceW
+  :: C8.ByteString
+  -> SCMHandle
+  -> EitherT Error IO ()
+killServiceW name scm = do
+  withService scm name serviceAccessQuery killService
 
 killService
-  :: C8.ByteString
-  -> IO (Maybe Error)
-killService bsname = C8.useAsCString bsname $ \name -> do
-  iret <- worker name
-  return $ case iret of
-    1    -> Nothing
-    0    -> Just "failed to terminate process"
-    (-1) -> Just "failed to open SCM"
-    (-2) -> Just "failed to open service"
-    (-3) -> Just "failed to query service status"
-    (-4) -> Just "failed to open service"
+  :: ServiceHandle
+  -> EitherT Error IO ()
+killService (ServiceHandle svc) =  do
+  iret <- liftIO $ worker
+  case iret of
+    1    -> E.right ()
+    0    -> E.left "failed to terminate process"
+    (-1) -> E.left "failed to query service status"
+    (-2) -> E.left "failed to open process"
+    some -> E.left $ "unexpected return code " `T.append` (T.pack $ show some)
     where
-      worker name = fromIntegral <$> do
-        [C.block|int
+      worker :: IO Int
+      worker = fmap fromIntegral $ do
+          [C.block|int
+          {
+            int ret = 0;
+            SERVICE_STATUS_PROCESS ssp;
+            DWORD out = 0;
+            if( !QueryServiceStatusEx( $(void* svc)
+                 , SC_STATUS_PROCESS_INFO
+                 , (LPBYTE)&ssp
+                 , sizeof( ssp)
+                 , &out
+                 ))
+            {
+              ret = -1;
+              goto cleanup3;
+            }
+
+            HANDLE h_proc = 0;
+            h_proc = OpenProcess( PROCESS_TERMINATE, 0, ssp. dwProcessId);
+            if( !h_proc)
+            {
+              ret = -2;
+              goto cleanup3;
+            }
+            if( !TerminateProcess( h_proc, 0))
+            {
+              ret = 0;
+              goto cleanup4;
+            }
+            ret = 1;
+
+            cleanup4:
+            CloseHandle( h_proc);
+            cleanup3:
+            return ret;
+          }|]
+
+withSCM
+  :: SCMAccess
+  -> ( SCMHandle
+     -> EitherT Error IO a
+     )
+  -> EitherT Error IO a
+withSCM (SCMAccess access) inner = do
+  ret <- liftIO $ E.bracket openSCM closeSCM wrapper
+  case ret of
+    Left some -> E.left some
+    Right some -> E.right some
+  where
+    openSCM:: IO (Either Error SCMHandle)
+    openSCM = do
+      rawptr <- [C.block|void*
         {
-          int ret = 0;
           SC_HANDLE h_scm = 0;
-          h_scm = OpenSCManager( 0, 0, GENERIC_READ);
-          if( !h_scm)
-          {
-            ret = -1;
-            goto cleanup1;
-          }
+          h_scm = OpenSCManager( 0, 0, $(unsigned long access));
+          return h_scm;
+        }
+        |]
+      return $ if rawptr == nullPtr
+        then Left "failed to open scm"
+        else Right $ SCMHandle rawptr
+    closeSCM:: Either Error SCMHandle -> IO ()
+    closeSCM (Left _) = return ()
+    closeSCM (Right (SCMHandle hSCM)) = [C.block|void
+      {
+        CloseServiceHandle( $(void * hSCM));
+      }|]
+    wrapper (Left some) = return $ Left some
+    wrapper (Right hSCM) = E.runEitherT $ inner hSCM
+
+withService
+  :: SCMHandle
+  -> C8.ByteString
+  -> ServiceAccess
+  -> ( ServiceHandle
+     -> EitherT Error IO a
+     )
+  -> EitherT Error IO a
+withService (SCMHandle hSCM) name (ServiceAccess access) inner = do
+  ret <- liftIO $ E.bracket openService closeService wrapper
+  case ret of
+    Left some -> E.left some
+    Right some -> E.right some
+  where
+    openService = C8.useAsCString name $ \cname -> do
+      rawptr <- [C.block|void*
+        {
           SC_HANDLE h_svc = 0;
-          h_svc = OpenService( h_scm, $(char * name), SERVICE_QUERY_STATUS);
-          if( !h_svc)
-          {
-            ret = -2;
-            goto cleanup2;
-          }
-
-          SERVICE_STATUS_PROCESS ssp;
-          DWORD out = 0;
-          if( !QueryServiceStatusEx( h_svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof( ssp), &out))
-          {
-            ret = -3;
-            goto cleanup3;
-          }
-
-          HANDLE h_proc = 0;
-          h_proc = OpenProcess( PROCESS_TERMINATE, 0, ssp. dwProcessId);
-          if( !h_proc)
-          {
-            ret = -4;
-            goto cleanup3;
-          }
-          if( !TerminateProcess( h_proc, 0))
-          {
-            ret = 0;
-            goto cleanup4;
-          }
-          ret = 1;
-
-          cleanup4:
-          CloseHandle( h_proc);
-          cleanup3:
-          CloseServiceHandle( h_svc);
-          cleanup2:
-          CloseServiceHandle( h_scm);
-          cleanup1:
-          return ret;
+          h_svc = OpenService( $(void *hSCM), $(char * cname), $(unsigned long access));
+          return h_svc;
         }|]
+      return $ if rawptr == nullPtr
+        then Left "openService failed"
+        else Right $ ServiceHandle rawptr
+    closeService (Left _ ) = return ()
+    closeService (Right (ServiceHandle hsvc)) = 
+      [C.exp|void{ CloseServiceHandle($(void * hsvc))}|]
+    wrapper (Left some ) = return $ Left some
+    wrapper (Right hsvc) = E.runEitherT $ inner hsvc
+
+waitForSvcStatus
+  :: ServiceHandle
+  -> ServiceState
+  -> EitherT Error IO ()
+waitForSvcStatus svc desiredState = do
+  state <- getServiceState svc
+  if state /= desiredState
+    then do
+      liftIO $ C.threadDelay 200000
+      waitForSvcStatus svc desiredState
+    else return ()
+
+startServiceSyncW
+  :: SCMHandle
+  -> C8.ByteString
+  -> EitherT Error IO ()
+startServiceSyncW scm name = withService scm name serviceAccessStart $ \svc -> 
+  do
+    startService svc
+    waitForSvcStatus svc SS_Running
+
+stopServiceSync
+  :: ServiceHandle
+  -> EitherT Error IO ()
+stopServiceSync svc = do
+  stopService svc
+  waitForSvcStatus svc SS_Stopped
+
+stopServiceSyncW
+  :: SCMHandle
+  -> C8.ByteString
+  -> EitherT Error IO ()
+stopServiceSyncW scm name = withService scm name serviceAccessStop stopServiceSync
+
+getServiceStateW
+  :: SCMHandle
+  -> C8.ByteString
+  -> EitherT Error IO ServiceState
+getServiceStateW scm name = withService scm name serviceAccessQuery getServiceState
+
+
+after
+  :: Int
+  -> EitherT Error IO a
+  -> EitherT Error IO a
+  -> EitherT Error IO a
+after delay payload timeoutWorker = do
+  mret <- liftIO $ T.timeout delay 
+    (E.runEitherT payload)
+  case mret of
+    Nothing -> timeoutWorker
+    Just (Left ret) -> E.left ret
+    Just (Right ret) -> E.right ret
 

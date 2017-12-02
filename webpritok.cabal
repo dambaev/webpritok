@@ -16,11 +16,15 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Service
+                     , FirebirdDB
+                     , Netstat
   build-depends:       base >= 4.7 && < 5
                      , bytestring
                      , inline-c
                      , text
                      , aeson
+                     , conduit
+                     , either
   default-language:    Haskell2010
   default-extensions:  Strict
   c-sources:           src/Service.c
@@ -43,6 +47,9 @@ executable webpritok-exe
                      , resourcet
                      , warp
                      , wai-conduit
+                     , either
+                     , transformers
+                     , binary
   default-language:    Haskell2010
 
 test-suite webpritok-test
