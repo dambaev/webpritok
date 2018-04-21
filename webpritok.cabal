@@ -19,6 +19,8 @@ library
                      , FirebirdDB
                      , Netstat
                      , Types
+                     , ServiceIO
+                     , Interface
   build-depends:       base >= 4.7 && < 5
                      , bytestring
                      , inline-c
@@ -26,9 +28,16 @@ library
                      , aeson
                      , conduit
                      , either
+                     , exceptions
+                     , binary
+                     , resourcet
+                     , conduit
+                     , conduit-extra
+                     , wai-conduit
+                     , directory
   default-language:    Haskell2010
   default-extensions:  Strict
-  c-sources:           src/Service.c src/Netstat.c
+  c-sources:           src/ServiceIO.c src/Netstat.c src/Types.c
   extra-libraries:     iphlpapi
   ghc-options:         -fno-full-laziness
 
@@ -37,6 +46,7 @@ executable webpritok-exe
   main-is:             Main.hs
   ghc-options:         -threaded -rtsopts -with-rtsopts=-N -with-rtsopts=-c -with-rtsopts=-T -fno-full-laziness
   default-extensions:  Strict
+  other-modules:       Production
   build-depends:       base
                      , webpritok
                      , scotty
@@ -44,11 +54,7 @@ executable webpritok-exe
                      , aeson
                      , wai
                      , bytestring
-                     , conduit
-                     , conduit-extra
-                     , resourcet
                      , warp
-                     , wai-conduit
                      , either
                      , transformers
                      , binary
@@ -58,6 +64,14 @@ executable webpritok-exe
                      , time
                      , stm
                      , random
+                     , SHA
+                     , exceptions
+                     , resourcet
+                     , conduit
+                     , conduit-extra
+                     , wai-conduit
+                     , directory
+                     , filepath
   default-language:    Haskell2010
 
 test-suite webpritok-test

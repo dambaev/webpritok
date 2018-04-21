@@ -1,31 +1,28 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleInstances #-}
 module Main where
 
 import qualified Web.Scotty as WS
+import qualified Web.Scotty.Internal.Types as WS
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.HTTP.Types.Method as HTTP
   ( methodPost
   )
-import qualified Network.HTTP.Types.Status as HTTP
-  ( serviceUnavailable503
-  , ok200
+import qualified Control.Monad.Trans.Resource as R
+import qualified Data.Conduit.List as C
+import qualified Data.Conduit.Binary as C
+import qualified Data.Conduit.Zlib as C
+import Data.Binary.Builder
+import qualified Network.Wai.Conduit as C
+  ( sourceRequestBody
   )
-
-import Control.Monad.IO.Class
-  ( liftIO
-  , MonadIO
-  )
-
-import qualified GHC.Stats as GS
-
-import qualified Data.Aeson.Types as A
-import qualified Network.Wai as Wai
-
 import qualified Data.ByteString.Char8 as C8
-
-import qualified Data.ByteString.Lazy.Char8 as LBS
-
+import qualified Data.Binary.Builder as B
+  ( fromByteString
+  )
+import Control.Monad.IO.Class
 import           Data.Conduit
   ( ($$)
   , ($$+)
@@ -37,35 +34,40 @@ import           Data.Conduit
   , Sink
   , awaitForever
   )
-import qualified Data.Conduit.List as C
-import qualified Data.Conduit.Binary as C
-import qualified Data.Conduit.Zlib as C
-import qualified Control.Monad.Trans.Resource as R
-import qualified Network.Wai.Conduit as C
-  ( sourceRequestBody
+
+import qualified Network.HTTP.Types.Status as HTTP
+  ( serviceUnavailable503
+  , ok200
   )
 
-import qualified Control.Monad.Trans.Either as E
-  ( runEitherT
-  , left
-  , right
-  , hoistEither
+import Control.Monad.IO.Class
+  ( liftIO
+  , MonadIO
   )
-import           Control.Monad.Trans.Either
-  ( EitherT
+import Control.Monad.Catch as E
+
+import qualified GHC.Stats as GS
+
+import qualified Data.Aeson.Types as A
+import qualified Network.Wai as Wai
+
+import Data.ByteString.Char8
+  ( ByteString
   )
+import qualified Data.ByteString.Char8 as BS
+import qualified Data.ByteString.Lazy.Char8 as LBS
+
 
 import Data.Binary.Builder
   ( Builder
   )
 
-import qualified Data.Binary.Builder as B
-  ( fromByteString
-  )
 import Control.Monad
   ( forM
+  , when
   )
 import Control.Monad.Trans.Class
+import qualified Control.Exception as CE
 import VTVar
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -74,12 +76,15 @@ import qualified Data.Text.Lazy as T
 import qualified Data.Text.Encoding as T
 import Data.Time.Clock (UTCTime)
 import qualified Data.Time.Clock as C
-import Control.Concurrent.STM (STM)
-import qualified Control.Concurrent.STM as S
 import System.Random (StdGen)
 import qualified System.Random as R
 
 import qualified Data.Foldable as F
+import qualified Data.Digest.Pure.SHA as S
+import qualified Debug.Trace as D
+import Control.Exception
+  ( SomeException
+  )
 
 import Types
 
@@ -88,8 +93,13 @@ import FirebirdDB
 import System.IO
 
 import Service
-
+import ServiceIO 
+    ( EServiceStopFailed(..)
+    )
+import System.FilePath
 import Netstat
+import Interface
+import Production
 
 type SessionId = Text
 type Sessions = Map SessionId (VTVar UTCTime)
@@ -110,39 +120,51 @@ opts = WS.Options
 main :: IO ()
 main = do
   state <- newState
-  app <- WS.scottyApp (myWebApp state)
+  salt <- getSalt
+  app <- WS.scottyApp (myWebApp state salt)
   WS.scottyOpts opts $ WS.middleware $ myMiddleware app
   where
     newState = do
-      sessions <- S.atomically $ newVTVar M.empty
+      sessions <- liftIO $ runWSTM $ atomicallyW $ newVTVar M.empty
       stdgen <- R.getStdGen
-      stdgenT <- S.atomically $ newVTVar stdgen
+      stdgenT <- liftIO $ runWSTM $ atomicallyW $ newVTVar stdgen
       return $ State 
         { sSessions = sessions
         , sStdGen = stdgenT
         }
+    getSalt = do
+      eread <- E.try $ readFile "etc/salt"
+      return $ case eread of
+        Left (e::SomeException) -> "0987653212"
+        Right (some::String)-> C8.pack $ head $ lines some
+
 
 myWebApp 
     :: State
+    -> ByteString
     -> WS.ScottyM ()
     
-myWebApp state = do
+myWebApp state salt = do
     -- maybe, it should be authenticated too?
+    -- first, authenticate get request
+    WS.get "/listsids" $ doListSessions state
+    WS.get (WS.function $ matchBadGetAuthenticate salt) $ doBadGetAuthenticate salt
     WS.get "/status" $ doStatus
     
     WS.get "/getsid" $ doGetSid state
-    WS.get "/listsids" $ doListSessions state
     
-    -- first, authenticate get request
-    WS.get (WS.function matchBadGetAuthenticate) doBadGetAuthenticate
-    WS.get "/service/state/:name" $ doServiceStatus
-    WS.get "/service/stop/:name" doServiceStop
-    WS.get "/service/start/:name" doServiceStart
-    WS.get "/service/kill/:name" doServiceKill
-    WS.get "/app/start" doAppStart
-    WS.get "/app/stop" doAppStop
-    WS.get "/app/status" doAppStatus
-    WS.get (WS.function $ \_-> Just []) $ handleGet
+    
+
+    WS.get "/service/state/:name" $ doServiceStatus state
+    WS.get "/service/stop/:name" $ doServiceStop state
+    WS.get "/service/start/:name" $ doServiceStart state
+    WS.get "/service/kill/:name" $ doServiceKill state
+    WS.get "/app/start" $ doAppStart state
+    WS.get "/app/stop" $ doAppStop state
+    WS.get "/app/status" $ doAppStatus state
+    WS.get "/app/backupdb/:dbpath" $ doBackupDB state
+    WS.get "/app/getdb" $ doAppGetDB state
+    WS.get (WS.function $ \_-> Just []) $ handleGet state
 
   -- post request
     -- WS.post (WS.function $ \_-> Nothing) undefined
@@ -181,100 +203,126 @@ doStatus = do
       stats <- liftIO $ GS.getGCStats
       WS.json $ stats
 
-handleGet:: WS.ActionM ()
-handleGet = do
+handleGet:: State-> WS.ActionM ()
+handleGet state = do
+  expireSessions state
   WS.html "handleGet"
 
 -- | will return Nothing if hash is presents and matches to request
-matchBadGetAuthenticate:: Wai.Request-> Maybe [WS.Param]
-matchBadGetAuthenticate req = Nothing {- let
---  reqNoHash = getUrlWithoutHash
-  in case mhash of
-       Nothing-> Just []
-       Just hash ->
-         if hash == rehashed
-           then Nothing
-           else Just []
-     where
-       query = Wai.queryString req
-       mhash = case filter (\(key, _) -> key == "hash") query of
-         [] -> Nothing
-         ((_, hash):_) -> case hash of
-                            Nothing -> Nothing
-                            Just some -> Just some
--}
-                                
-doBadGetAuthenticate:: WS.ActionM ()
-doBadGetAuthenticate = WS.status HTTP.serviceUnavailable503
+matchBadGetAuthenticate:: ByteString-> Wai.Request-> Maybe [WS.Param]
+matchBadGetAuthenticate salt req = case mqueryHash of
+    Nothing        -> Just []
+    Just queryHash | queryHash == calculatedHash -> D.trace 
+        ("queryHash = " ++ BS.unpack queryHash ++ ", calculated ++ " ++ BS.unpack calculatedHash) Nothing
+    _ -> Just []
+  where
+       query
+          = if C8.length queryNoHashStr > 0
+          then Wai.rawPathInfo req 
+            `C8.append` "?"
+            `C8.append` queryNoHashStr
+          else Wai.rawPathInfo req
+       queryNoHash = reverse queryNoHash'
+       (mqueryHash, queryNoHash')
+          = F.foldl' helper (Nothing,[]) $ Wai.queryString req
+       helper (hashTmp, tmp) item@(key, mval) = case key of
+          "hash" -> (mval, tmp)
+          _ -> let
+            itemstr = case mval of
+              Nothing-> key
+              Just val -> key `C8.append` "=" `C8.append` val
+            in (hashTmp, itemstr:tmp)
+       queryNoHashStr = C8.intercalate "&" queryNoHash
+       calculatedHash
+          = C8.pack 
+          $ S.showDigest
+          $! S.sha256
+          $ LBS.fromStrict
+          $ query `C8.append` salt
+
+doBadGetAuthenticate:: ByteString-> WS.ActionM ()
+doBadGetAuthenticate salt = do
+  req <- WS.request
+  let requestNoSalt
+          = if C8.length queryNoHashStr > 0
+          then Wai.rawPathInfo req 
+            `C8.append` "?"
+            `C8.append` queryNoHashStr
+          else Wai.rawPathInfo req
+      queryNoHash = reverse queryNoHash'
+      (mqueryHash, queryNoHash')
+          = F.foldl' helper (Nothing,[]) $ Wai.queryString req
+      helper (hashTmp, tmp) item@(key, mval) = case key of
+          "hash" -> (mval, tmp)
+          _ -> let
+            itemstr = case mval of
+              Nothing-> key
+              Just val -> key `C8.append` "=" `C8.append` val
+            in (hashTmp, itemstr:tmp)
+      queryNoHashStr = C8.intercalate "&" queryNoHash
+      calculatedHash
+          = C8.pack 
+          $ S.showDigest
+          $! S.sha256
+          $ LBS.fromStrict
+          $ requestSalt
+      requestSalt = requestNoSalt `C8.append` salt
+  WS.text "bad hash"
+  WS.status HTTP.serviceUnavailable503
+  liftIO $ C8.putStrLn "bad hash"
+  liftIO $ C8.putStrLn requestSalt
+  liftIO $ C8.putStrLn $ Wai.rawQueryString req
+  liftIO $ C8.putStrLn calculatedHash
 
   
 
 -- | checks 
-doServiceStatus:: WS.ActionM ()
-doServiceStatus = do
+doServiceStatus:: State-> WS.ActionM ()
+doServiceStatus state = do
+  expireSessions state
   name <- WS.param "name"
-  estate <- liftIO $ E.runEitherT $ withSCM scmAccessRead $ \scm-> getServiceStateW scm name
-  case estate of
-    Right status -> WS.json status
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
-  where
-    
+  state <- liftIO $ withSCM scmAccessRead $ \scm-> getServiceStateW scm name
+  WS.json state
       
 
 -- | checks 
-doServiceStart:: WS.ActionM ()
-doServiceStart = do
+doServiceStart:: State-> WS.ActionM ()
+doServiceStart state = do
+  expireSessions state
   name <- WS.param "name"
-  merr <- liftIO $ E.runEitherT $ withSCM scmAccessAll $ \scm-> startServiceSyncW scm name
-  case merr of
-    Right _ -> do
-      WS.status HTTP.ok200
-      WS.text ""
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
+  liftIO $ withSCM scmAccessAll $ \scm-> startServiceSyncW scm name
+  WS.status HTTP.ok200
 
 -- | checks 
-doServiceStop:: WS.ActionM ()
-doServiceStop = do
+doServiceStop:: State-> WS.ActionM ()
+doServiceStop state = do
+  expireSessions state
   name <- WS.param "name"
-  merr <- liftIO $ E.runEitherT $ withSCM scmAccessAll $ \scm-> stopServiceSyncW scm name
-  case merr of
-    Right _ -> WS.status HTTP.ok200
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
+  liftIO $ withSCM scmAccessAll $ \scm-> stopServiceSyncW scm name
+  WS.status HTTP.ok200
 
 uploadDB :: Wai.Application 
 uploadDB request respond = do
   -- check for free space, header and etc
-  eret <- E.runEitherT $ do
-    checkFreeSpace
-    uploadTempFile request
+  -- checkFreeSpace
+  uploadTempFile request
   
-  case eret of
-    Left err  -> respond $ Wai.responseLBS HTTP.serviceUnavailable503 [] $ 
-      LBS.pack err
-    Right _ -> respond $ Wai.responseLBS HTTP.ok200 [] ""
+  respond $ Wai.responseLBS HTTP.ok200 [] ""
 
-checkFreeSpace:: EitherT String IO ()
-checkFreeSpace = E.right ()  
+data DBWrongHeader = DBWrongHeader
+  deriving (Show)
+instance Exception DBWrongHeader
 
 uploadTempFile 
   :: Wai.Request 
-  -> EitherT String IO ()
+  -> IO ()
 uploadTempFile request = do
-  (src, check) <- lift 
-    $ R.runResourceT 
+  (src, check) <- R.runResourceT 
     $ C.sourceRequestBody request 
     $$+ checkHeaderC -- check if header is fit
-  if not check
-    then E.left "check failed"
-    else do
-        lift $ R.runResourceT $ src $$+- C.sinkFile "test2"
-        E.right ()
+  when (not check) $ throwM DBWrongHeader
+  R.runResourceT $ src $$+- C.sinkFile "test2"
+  return ()
   
 
 
@@ -287,123 +335,120 @@ myMiddleware app app1 request respond = do
           else app request respond
     _ -> app request respond
 
-doServiceKill :: WS.ActionM ()
-doServiceKill = do
+doServiceKill :: State-> WS.ActionM ()
+doServiceKill state = do
+  expireSessions state
   name <- WS.param "name"
-  merr <- liftIO $ E.runEitherT $ withSCM scmAccessAll $ killServiceW name
-  case merr of
-    Right _ -> WS.status HTTP.ok200
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
+  liftIO $ withSCM scmAccessAll $ killServiceW name
+  WS.status HTTP.ok200
 
-doDownloadDB :: WS.ActionM ()
-doDownloadDB = do
-  efile <- E.runEitherT backupDB
-  case efile of
-    Left _ -> WS.status HTTP.serviceUnavailable503
-    Right file -> WS.stream $ \write flush ->
-      R.runResourceT $ C.sourceFile file $$ C.gzip =$ streamConsumer write flush
+doBackupDB :: State-> WS.ActionM ()
+doBackupDB state = do
+  expireSessions state
+  dbpath <- WS.param "dbpath"
+  -- liftIO $ runBackup dbpath
+  WS.stream $ runBackup dbpath
+
+
+runBackup
+  :: ( MonadIO m
+     , UsesHTTPFileResponse m
+     , ForksChild m
+     , ReadsFile m
+     , DeletesFile m
+     )
+  => ByteString
+  -> (Builder-> IO ())
+  -> IO ()
+  -> m ()
+runBackup dbpath write flush = do
+  doesFileExist file >>= \flag-> when flag $ removeFile file
+  runGBAK
+  downloadFile file write flush
   where
-    streamConsumer :: MonadIO m 
-      => (Builder -> IO ())
-      -> IO ()
-      -> Sink C8.ByteString m ()
-    streamConsumer write flush = awaitForever $ \buff -> liftIO $ do
-      write $ B.fromByteString buff
-      flush
+    file = C8.pack $ replaceFileName (C8.unpack dbpath) "webpritok.tmp"
+    runGBAK = do
+      runProgram "gbak" []
+  
 
-backupDB :: MonadIO m => EitherT String m FilePath
-backupDB = 
-    -- execute gbak and wait for timeout
-    E.left "error"
 
-doAppStart :: WS.ActionM ()
-doAppStart = do
-    eret <- liftIO $ E.runEitherT $ withSCM scmAccessAll $ \scm-> do
-      startServiceSyncW scm "FirebirdServerDefaultInstance"
-      startServiceSyncW scm "prt_ManagerDB"
-      startServiceSyncW scm "prt_Kernel"
-      startServiceSyncW scm "prt_ApMonitor"
-    case eret of
-      Left err -> do
-        WS.status HTTP.serviceUnavailable503
-        WS.text err
-      Right _ -> do
-        WS.status HTTP.ok200
-
-doAppStop :: WS.ActionM ()
-doAppStop = do
-  eret <- liftIO $ E.runEitherT $ withSCM scmAccessAll $ \scm-> do
-    let stopOrKillSvc delay name = withService scm name serviceAccessAll $ \svc-> after delay
-          (stopServiceSync svc) (killService svc)
-    mapM (stopOrKillSvc  5000000) services
-  case eret of
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
-    Right _ -> do
-      WS.status HTTP.ok200
+doAppStart :: State-> WS.ActionM ()
+doAppStart state = do
+  expireSessions state
+  liftIO $ withSCM scmAccessAll $ \scm-> mapM_ (helper scm) services
+  WS.status HTTP.ok200
   where
+    helper scm svc = do
+        putStrLn $ "starting " ++ (BS.unpack svc)
+        startServiceSyncW scm svc
+    services = [ "FirebirdServerDefaultInstance"
+               , "prt_ManagerDB"
+               , "prt_Kernel"
+               , "prt_ApMonitor"
+               ]
+
+doAppStop :: State-> WS.ActionM ()
+doAppStop state = do
+  expireSessions state
+  liftIO $ withSCM scmAccessAll $ \scm-> do
+    mapM_ (stopOrKillSvc scm 5000000) services
+  WS.status HTTP.ok200
+  where
+    stopOrKillSvc scm delay name = withService scm name serviceAccessAll $ \svc-> do
+        putStrLn $ "stopping " ++ (BS.unpack name)
+        E.handle (\EServiceStopFailed-> killService svc) 
+          $ after delay (stopServiceSync svc) (killService svc)
     services = [ "prt_ApMonitor", "prt_Kernel", "prt_ManagerDB"
                , "FirebirdServerDefaultInstance"]
 
-doAppStatus :: WS.ActionM ()
-doAppStatus = do
-  eret <- liftIO $ E.runEitherT $ do
+doAppStatus :: State-> WS.ActionM ()
+doAppStatus state = do
+  expireSessions state
+  req <- WS.request
+  let reqPath = Wai.rawPathInfo req `C8.append` Wai.rawQueryString req
+  ret <- liftIO $ do
     estates <- worker
     listen <- isTcpPortListening 6000
-    case (listen, estates) of
-      (False, _)      -> E.right False
-      ( True, states) -> E.right $ if all (== SS_Running) states
-        then True
-        else False
-  case eret of
-    Left err -> do
-      WS.status HTTP.serviceUnavailable503
-      WS.text err
-    Right True -> WS.status HTTP.ok200
-    Right False -> WS.status HTTP.serviceUnavailable503
+    return $ case (listen, estates) of
+      (False, _)      -> False
+      ( True, states) 
+        | all (== SS_Running) states -> True
+        | otherwise -> False
+  WS.status $ if ret 
+    then HTTP.ok200
+    else HTTP.serviceUnavailable503
   where
     services = [ "FirebirdServerDefaultInstance", "prt_ManagerDB", "prt_Kernel", "prt_ApMonitor"]
-    worker :: EitherT Error IO [ServiceState]
+    worker :: IO [ServiceState]
     worker = withSCM scmAccessRead $ \scm-> forM services $ getServiceStateW scm
 
 doGetSid 
   :: State
   -> WS.ActionM ()
 doGetSid state = do
-  liftIO $ expireSessions (sSessions state)
-  sessionId <- liftIO $ blockVTVarIO readvars calc write
+  expireSessions state
+  Just sessionId <- snd <$> (liftIO $ rcuVTVar readvars calc write)
   WS.status HTTP.ok200
   WS.text sessionId
   return ()
   where
-    readvars :: STM (VTVarI StdGen, VTVarI Sessions)
-    readvars = (,)
-      <$> ( readVTVar $ sStdGen state )
-      <*> ( readVTVar $ sSessions state )
-    calc:: (VTVarI StdGen, VTVarI Sessions)-> IO (SessionId, Maybe (VTVarI StdGen, VTVarI Sessions))
-    calc ((stdgen0, stdgenV), (sessions0, sessionsV)) = do
-      let loop stdgen = do
-            let (digitsStr, newstdgen) = genDigits stdgen 6 []
-            case M.lookup digitsStr sessions0 of
-              Nothing-> return (digitsStr, newstdgen)
-              Just _ -> loop newstdgen
-      (sessionId, stdgen) <- loop stdgen0
-      currtime <- C.getCurrentTime
-      currtimeT <- S.atomically $ newVTVar currtime
-      let sessions = M.insert sessionId currtimeT sessions0
-      return 
-        ( sessionId
-        , Just ( ( stdgen, stdgenV)
-               , ( sessions, sessionsV)
-               )
-        )
-    write:: ((VTVarI StdGen), (VTVarI Sessions)) -> STM ()
-    write (stdgenI, sessionsI) = do
+    readvars = do
+      currtime <- RSTM $ C.getCurrentTime
+      atomicallyR $ do
+        first<- readVTVar $ sStdGen state 
+        second <- readVTVar $ sSessions state 
+        return (currtime,first,second)
+    calc (currtime, (stdgen0, stdgenV), sessions@(sessions0, sessionsV)) = 
+        let (digitsStr, newstdgen) = genDigits stdgen0 6 []
+        in case M.lookup digitsStr sessions0 of
+          Nothing-> ((), Just (currtime, digitsStr, (newstdgen, stdgenV), sessions))
+          Just _ -> calc (currtime, (newstdgen, stdgenV), sessions)
+    write (currtime,sessionId, stdgenI, (sessions0,sessionsV)) = do
+      currtimeT <- newVTVar currtime
       writeVTVar (sStdGen state) stdgenI
-      writeVTVar (sSessions state) sessionsI
+      writeVTVar (sSessions state) (M.insert sessionId currtimeT sessions0, sessionsV)
+      return sessionId
+
     genDigits
       :: StdGen
       -> Int
@@ -416,18 +461,23 @@ doGetSid state = do
         newn = n - 1
         newtmp = newdigit:tmp
 
-expireSessions:: VTVar Sessions-> IO ()
-expireSessions sessionsT = do
-  blockVTVarIO readvars calc write
+expireSessions
+  :: ( MonadIO m
+     )
+  => State
+  -> m ()
+expireSessions state = do
+  liftIO $ ruVTVar readvars write
+  return ()
   where
-    readvars = readVTVar sessionsT
-    calc::(VTVarI Sessions)-> IO ((), Maybe (VTVarI Sessions))
-    calc (sessions0, sessionsV) = do
-      currtime <- C.getCurrentTime
+    sessionsT = sSessions state
+    readvars = do
+      currtime <- RSTM $ C.getCurrentTime
+      (sessions0,sessionsV) <- atomicallyR $ readVTVar sessionsT
       let helper tmp (sessionId,timeT)  = do
-            (sessTime, _ ) <- S.atomically $ readVTVar timeT
+            (sessTime, _ ) <- atomicallyR $ readVTVar timeT
             let secs = truncate $ C.diffUTCTime currtime sessTime
-            return $ if secs < timeout
+            return $ if secs < Main.timeout
               then tmp
               else sessionId:tmp
       sessions <- F.foldlM helper [] $ M.toList sessions0
@@ -438,10 +488,16 @@ expireSessions sessionsT = do
 
 doListSessions:: State-> WS.ActionM ()
 doListSessions state = do
-  liftIO $ expireSessions $ sSessions state
-  (sessions0, _)<- liftIO $ S.atomically $ readVTVar $ sSessions state
-  sessions <- liftIO $ forM (M.toList sessions0) $ \(session, timeT)-> do
-    (time0, _) <- S.atomically$ readVTVar timeT
+  expireSessions state
+  (sessions0, _) <- liftIO $ runRSTM $ atomicallyR $ readVTVar $ sSessions state
+  sessions <- forM (M.toList sessions0) $ \(session, timeT)-> do
+    (time0, _) <- liftIO $ runRSTM $ atomicallyR $ readVTVar timeT
     return $ session `T.append` ": " `T.append` ( T.pack $ show time0)
   WS.status HTTP.ok200
   WS.text $ T.concat sessions
+
+doAppGetDB:: State-> WS.ActionM ()
+doAppGetDB state = do
+  expireSessions state
+  
+

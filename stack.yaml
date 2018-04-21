@@ -39,7 +39,7 @@ packages:
 - '.'
 - location:
     git: https://github.com/dambaev/vtvar.git
-    commit: 6c9c07ce2c77ea4636d56acd628e0350c5815151
+    commit: ade4bcd7e00cde9ff228e31816d5f5683a4fe264
     extra-dep: true
 
 # Dependency packages to be pulled from upstream that are not in the resolver

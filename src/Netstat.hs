@@ -7,6 +7,7 @@ module Netstat
     where
 
 import qualified Language.C.Inline as C
+import Control.Monad.Catch as E
 import qualified Control.Monad.Trans.Either as E
   ( left
   , right
@@ -30,16 +31,19 @@ C.include "winsock2.h"
 C.include "ws2tcpip.h"
 C.include "iphlpapi.h"
 
+data ETCPTableQuery = ETCPTableQuery
+    deriving Show
+instance Exception ETCPTableQuery
 
 isTcpPortListening
     :: Int
-    -> EitherT Error IO Bool
+    -> IO Bool
 isTcpPortListening port' = do
-    ret <- liftIO $ worker
+    ret <- worker
     case () of
-        _ | ret < 0 -> E.left "error querying tcptable"
-        _ | ret == [C.pure|int{MIB_TCP_STATE_LISTEN}|] -> E.right True
-        _ -> E.right False
+        _ | ret < 0 -> throwM ETCPTableQuery
+        _ | ret == [C.pure|int{MIB_TCP_STATE_LISTEN}|] -> return True
+        _ -> return False
     where
         port = fromIntegral port'
         worker :: IO C.CInt
